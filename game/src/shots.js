@@ -1,79 +1,132 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=cover|chase|city|night. Each one plays the
+// real rules forward from a fresh world for a fixed number of steps, steered by
+// a simple autopilot (drive the road ahead, keep clear of buildings, keep the
+// wanted level hot in a chase), so the frame is what real play looks like and
+// the same seed always gives the same frame. The scene paints twice and sets
+// window.__shotReady for the screenshot tool.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { STEP } from './config.js';
+import { LANDMARKS } from './city.js';
+import { EVENT_BUSTED, EVENT_WASTED } from './world.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function landmark(name) {
+  return LANDMARKS.find((l) => l.name === name);
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+/** Drive toward a waypoint, steering proportional to the heading error. */
+function drivePilot(world, tx, ty) {
+  const p = world.state.player;
+  const car = p.car;
+  const base = { moveX: 0, moveY: 0, run: false, steer: 0, gas: false, brake: false, aimX: p.x, aimY: p.y, firing: false, enter: false, reload: false, startMission: -1 };
+  if (!car) return base;
+  const targetAngle = Math.atan2(ty - car.y, tx - car.x);
+  let diff = targetAngle - car.angle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  base.steer = Math.abs(diff) > 0.06 ? Math.sign(diff) : 0;
+  base.gas = true;
+  return base;
+}
+
+/** Walk toward a point, shooting nothing, looking at it. */
+function walkPilot(world, tx, ty) {
+  const p = world.state.player;
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return {
+    moveX: dx / len, moveY: dy / len, run: false, steer: 0, gas: false, brake: false,
+    aimX: tx, aimY: ty, firing: false, enter: false, reload: false, startMission: -1,
+  };
+}
+
+const IDLE = { moveX: 0, moveY: 0, run: false, steer: 0, gas: false, brake: false, aimX: 0, aimY: 0, firing: false, enter: false, reload: false, startMission: -1 };
+
+/** Stage the player into the nearest usable car at (x, y), facing `angle`. */
+function putPlayerInCar(world, x, y, angle) {
+  const p = world.state.player;
+  let best = null;
+  let bestD = Infinity;
+  for (const car of world.state.cars) {
+    if (car.wreck || car.kind === 'police') continue;
+    const d = Math.hypot(car.x - x, car.y - y);
+    if (d < bestD) {
+      bestD = d;
+      best = car;
     }
   }
-  return best;
+  if (!best) return false;
+  best.x = x;
+  best.y = y;
+  best.angle = angle;
+  best.speed = 0;
+  p.x = x;
+  p.y = y + 44;
+  p.angle = angle;
+  world.step(STEP, { ...IDLE, aimX: x, aimY: y, enter: true });
+  return p.car === best;
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it.
+ * The scenes:
+ * - cover: driving Rosa's coupe down the Neon Strip road at golden hour, first job live.
+ * - chase: a three-star police chase along the long east road, sirens and all.
+ * - city: on foot in Palmetto Plaza, traffic and pedestrians around.
+ * - night: cruising the beach road at night, wanted level two, PD in pursuit.
  */
 export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  const state = world.state;
+  const p = state.player;
+  const steps = (seconds) => Math.floor(seconds / STEP);
+  const idle = { moveX: 0, moveY: 0, run: false, steer: 0, gas: false, brake: false, aimX: p.x, aimY: p.y, firing: false, enter: false, reload: false, startMission: -1 };
+
+  if (name === 'chase') {
+    // Steal a car on the east road, then run west with the PD behind.
+    putPlayerInCar(world, 2880, 560, Math.PI);
+    p.wanted = 3;
+    for (let i = 0; i < steps(5); i += 1) {
+      const c = drivePilot(world, 300, 536);
+      const outcome = world.step(STEP, c);
+      if (outcome.events & (EVENT_BUSTED | EVENT_WASTED)) break;
+    }
+    return { screen: 'play' };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'city') {
+    const plaza = landmark('Palmetto Plaza');
+    p.x = plaza.x;
+    p.y = plaza.y;
+    p.wanted = 0;
+    for (let i = 0; i < steps(6); i += 1) {
+      const c = walkPilot(world, plaza.x + 220, plaza.y + 130);
+      world.step(STEP, c);
+    }
+    return { screen: 'play' };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'night') {
+    // Cruise the beach sand westward at night, PD on the tail.
+    state.timeOfDay = 22.2;
+    putPlayerInCar(world, 2900, 2520, Math.PI);
+    p.wanted = 2;
+    for (let i = 0; i < steps(5); i += 1) {
+      const c = drivePilot(world, 300, 2500);
+      const outcome = world.step(STEP, c);
+      if (outcome.events & (EVENT_BUSTED | EVENT_WASTED)) break;
+    }
+    return { screen: 'play' };
+  }
+
+  // cover (default): take Rosa's coupe from the garage and run it to Marina Bay.
+  state.timeOfDay = 17.3;
+  p.x = 660;
+  p.y = 640;
+  world.step(STEP, { ...idle, enter: true });
+  p.wanted = 1;
+  for (let i = 0; i < steps(5); i += 1) {
+    const c = drivePilot(world, 3050, 536);
+    world.step(STEP, c);
+  }
+  return { screen: 'play' };
 }
